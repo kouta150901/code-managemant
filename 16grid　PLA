@@ -1,0 +1,331 @@
+clear; clc; close all; %変数やコマンドウィンドウをリセット、グラフを閉じる
+%% 設定部分 （音源位置・材質・形状）
+%=============================================================
+% OBJECT_MODE = 'none' / 'rigid'/'PLA' / 'absorber'
+% SOUND_WHICH = 'right'; right/left
+% OBJECT_SHAPE = 'cube'; sphere/cube
+%=============================================================
+OBJECT_MODE = 'PLA';   
+SOUND_WHICH = 'right';  
+OBJECT_SHAPE= 'sphere'; 
+c_pla=2200;
+yx_mic_to_plot = 7;
+%% 基本設定（空気）
+c = 344; rho = 1.225; f = 4800;     %音速m/s・密度kg/m^3・中心周波数hz
+ppw = 6;                               % λあたり　分割1波長あたりの分割数
+lambda = c/f; dx = lambda/ppw;       %周波数f0に置ける波長　
+                                       %空間ステップサイズ　　シミュレーションの基本単位
+% グリッド
+Nx =16; Ny = 16; Nz = 16;            %マス数
+PML = 2;
+kgrid = kWaveGrid(Nx, dx, Ny, dx, Nz, dx);
+
+%% 背景媒質
+medium.sound_speed = single(c*ones(Nx,Ny,Nz,'single')); %音速の設定
+medium.density     = single(rho*ones(Nx,Ny,Nz,'single')); %密度の設定
+medium.alpha_mode  = 'no_dispersion'; %周波数分散を考慮しない
+medium.alpha_power = 1.5;  %音響減衰の周波数依存性の指数
+medium.alpha_coeff = zeros(Nx,Ny,Nz,'single');%音響減衰係数　音の吸収は無視
+
+cx = round((Nx+1)/2); cy = round((Ny+1)/2); cz = round((Nz+1)/2); %物体の中心点(cx,cy,cz)の位置の設定
+r_grid = 1;   % 物体半径 [grid]
+
+%% 音源位置
+source.p_mask = false(Nx,Ny,Nz); %音圧源のマスクの定義初期値は音源なし　下準備
+%音源は物体のすぐ外側であり、PMLの内側に位置しなければならない
+y_right = min(cy + (r_grid+1), Ny-PML); %右の音源の位置 
+y_left  = max(cy - (r_grid+1), 1+PML); %左の音源の位置
+
+%右音源と左音源を切り替える　上部で切り替え
+switch SOUND_WHICH
+    case'right'
+        source.p_mask(cx, y_right, cz) = true; % 右（+y）
+        disp('Source plased: RIGHT')
+    case'left'
+        source.p_mask(cx, y_left , cz) = true;   % 左（-y）
+        disp('Source placed:LEFT');
+end
+
+%% マスク（物体 & 音源）
+
+
+%マスク生成
+% 中心座標からの2乗が球の半径の２乗以下であるかどうかを判定
+%球の内部の媒質特性（音速や密度）が後で上書きされる
+[ix,iy,iz] = ndgrid(1:Nx,1:Ny,1:Nz); %座標インデックスを作成
+
+switch OBJECT_SHAPE
+    case 'sphere'
+        % 球マスク　球を物体にするため
+        object_mask = (ix-cx).^2+(iy-cy).^2+(iz-cz).^2 <= r_grid^2;
+        disp('Object shape:sphere')
+    case'cube'
+        %立方体マスク
+        object_mask = (ix-cx).^2<=r_grid^2 & (iy-cy).^2<=r_grid^2 & (iz-cz).^2<=r_grid^2;
+        disp('Object shape:cube')
+end
+
+%% 180個のマイクの配置
+num_mics = 180; %マイクの個数180個
+phi_rad_angle = linspace(0,2*pi,num_mics); %角度　
+
+mic_r_grid = 4; %マイク配置の半球の半径
+
+%半球上にマイクを配置 原点基準の（x,y,z）座標
+switch SOUND_WHICH
+    case 'right'
+        mic_y_position = round(cy+r_grid+mic_r_grid*sin(phi_rad_angle)); %y
+    case 'left'
+        mic_y_position = round(cy-r_grid+mic_r_grid*sin(phi_rad_angle)); %y
+end
+
+mic_x_position = round(cx+mic_r_grid*cos(phi_rad_angle)); %x
+mic_z_position = round(cz+mic_r_grid*cos(phi_rad_angle)); %z
+
+%縦横の２本の線にする
+y_sensor.mask = false(Nx,Ny,Nz);
+for i = 1:num_mics
+    y_sensor.mask(cx,mic_y_position(i),mic_z_position(i)) = true; %縦y軸 blue
+end
+x_sensor.mask = false(Nx,Ny,Nz);
+for i = 1:num_mics
+    x_sensor.mask(mic_x_position(i),mic_y_position(i),cz) = true; %横x軸red
+end
+
+
+%x軸y軸のマイクを結合する
+%論理和を用いて結合する　どちらか一方がtrueだったら結合
+%roundによる丸め込みおよび、x軸y軸の交点の位置で重複があるため全部で356点のマイクが存在する
+sensor.mask = y_sensor.mask | x_sensor.mask;
+
+disp("sensor_num="+sum(sensor.mask(:)))
+%マイクで記録する音響量を指定する
+%'p' 全時間ステップの音圧　シミュレーションの各時間ステップに置ける音圧の値を記録
+%'p_final' 最終時間ステップの音圧 シミュレーションが終了した瞬間の音圧分布を記録する　音圧分布図を作成するときに使われる
+sensor.record = {'p','p_final'};
+
+%% 材質切替　
+%球の材質を剛体＆吸収体＆なし　で切り替える
+
+
+switch OBJECT_MODE
+    case 'rigid'
+        medium.density(object_mask)     = single(1240);%密度を150倍
+        medium.sound_speed(object_mask) = single(c); %背景媒質と同じ
+    case 'rigid2'
+        medium.density(object_mask)     = single(1.225);%密度を150倍
+        medium.sound_speed(object_mask) = single(c*2); %背景媒質と同じ
+    case 'PLA'
+        medium.density(object_mask)     = single(1240);%密度1,200kg/m^3
+        medium.sound_speed(object_mask) = single(c_pla); %音速2200m/s
+    case 'absorber'
+        medium.alpha_coeff(object_mask) = single(80); %音響減衰係数　
+    case 'none' 
+        %物体なし 
+        
+end
+
+
+
+
+
+
+% グリッドの対角線距離を計算 (最大伝播距離)
+%max_distance = sqrt((Nx*dx)^2 + (Ny*dx)^2 + (Nz*dx)^2); %Nx,Ny,Nzシミュレーション空間のセル数,dxセル間隔,cθ音速
+%time_to_propagate = max_distance / c; %最大距離を音速で割って音が空間の端から端までに届く時間を求めている
+
+% 余裕を持たせた総シミュレーション時間（秒）を設定 反射や遅延のための余裕
+%total_sim_time = time_to_propagate * 10; 
+total_sim_time =1e-2; %強制的に時間を確保する　0.01秒
+% ------------------------------------------------------------------
+
+% kgridに時間グリッドを確定
+% kgridとはFDTDで使う時間軸を自動生成する関数
+% CFL条件　数値が発散しないように時間刻みを制限する条件のこと
+%CFL_const = 0.2; %CFL_constは安定条件を満たすための値
+%kgrid.makeTime(2200, CFL_const, total_sim_time); %kgrid.makeTime(medium, CFL, t_end) medium=音速や密度を含む構造体、t_end=シミュレーションを終了する時刻
+
+%%kgrid.setTimeを使う方法
+
+CFL_const = 0.05; %CFL_constは安定条件を満たすための値
+c_clf=c_pla; %CFL計算に用いる音速をPLAの速度に設定
+%c_clf=max(medium.sound_speed(:));
+disp("max_sound_speed="+c_clf)
+dt_clf_max=dx/c_clf; %最大の時間刻みを設定
+dt_clf_final=CFL_const*dt_clf_max;%最終的な時間刻み
+
+% total_sim_time / dt_clf_final が整数にならないとエラーになるため、
+% Nt (総ステップ数) を計算し、dt を Nt に合わせて微調整します。 roundで整数にする
+Nt = round(total_sim_time / dt_clf_final);
+dt_clf_final = total_sim_time / Nt; % 新しいdtでtotal_sim_timeを割り切れるように調整
+
+disp("Nt="+Nt)
+disp("dt_clf_final="+dt_clf_final)
+% kgrid.setTime(dt, t_end)
+kgrid.setTime(Nt, dt_clf_final);
+%kgrid.setTime(460465, 1.0859e-06);
+
+
+cc = max(medium.sound_speed(:));
+dx = kgrid.dx;
+CFL = cc * dt_clf_final / dx;
+disp("CFL="+CFL)
+
+
+
+%% -- TSP 信号の合成
+% -- 設定値
+fs=1/kgrid.dt; %サンプリング周波数, fs=1/dtでシミュレーションにTSP信号を合わせる
+N=2^14; A=0.8; %FF長信号のサンプル数,最大振幅通常は0~1。オーバーフローの危険性より80％に設定
+k = 0 : N-1;        % kk：離散周波数番号
+S=zeros(1,N);        % Sを初期化
+S(k+1) = exp(-1j*2*pi*N/2*(k/ N).^2 ); % 2乗位相の関数で周波数に応じて位相が非線形に変化する　これによって時間軸上で周波数が徐々に変化するチャープ信号になる
+S( N/2+2: N) = conj( S( N/2: -1: 2));  % 複素共役をとる操作　実信号を得るために周波数スペクトルをエルミート対象にする
+
+tsp = real(ifft(S));           % 逆FFTで周波数波形から時間波形を得る　real()は数値誤差ででる微小な虚部を除去　結果としてTSP信号が得られる
+
+% 波形の後半の1/4を先頭に移動　音の始まりを低周波から始まるように整える
+tsp = [tsp(N/4*3+1: N), tsp(1:N/4*3 )]; 
+tsp = tsp /(max(abs(tsp)) /A);  % 振幅最大をAにする　オーバーフローを防ぐため
+
+%%音源波形の設定
+%source 音源の特性を定義する
+%.p source構造のフィールドの一つで、音源から放出する圧力の時間変化を保持する
+%s TSP信号の時間波形データ
+source.p=tsp;
+
+%resample 信号のサンプリングレートを変更する　必要かどうか分からない
+%source.p = resample(source.p, kgrid.Nt, length(source.p));
+
+
+
+
+%% 実行
+
+input_args = {'PMLInside',false,'PMLSize',[PML PML PML], ...　% 'PMLInside', false PMLを計算領域の外側に配置　%各軸方向のPML厚さ（セル数）
+              'DataCast','single','PlotSim',false};           %内部配列を単精度で計算・保持し、メモリ使用量と計算負荷を低減 %ステップごとの描画を無効化し、速度を優先
+disp(['Running 3D case: ' OBJECT_MODE ' ...']);               
+% kgrid 時間・空間のグリッド設定　座標軸と時間刻みなどを設定
+% medium 媒質の物理特性　音速・密度・減衰などを設定
+% source 音源設定　音源波形・音源位置・駆動信号
+% sensor　センサ設定　計測点の位置・記録する物理量
+% input_args{:}追加オプション　PML・精度・描画設定
+%シミュレーションを実行
+sensor_data = kspaceFirstOrder3D(kgrid, medium, source, sensor, input_args{:});  %souse
+% kgrid.t_array の最大値を出力
+disp(max(kgrid.t_array));
+% ----------------------------------------------------
+
+%% --- yx軸のマイク結果のプロット ---
+%1~num_mics(180)までがｙ軸のマイク　num_mics(180)+1~356までがx軸のマイク
+%重複の関係とroundによる丸め込みの影響で、356個のマイク
+%16^3の場合だと62個
+
+% 任意のマイクのTSP応答（生データ）をプロット
+figure('Name','Recorded TSP Response','Color','w');
+% データ: sensor_data.p を使用 (シミュレーションの生出力)
+%　t_array 基準の時間軸 
+p_received = sensor_data.p(yx_mic_to_plot,:);
+t = kgrid.t_array;
+
+figure(1);
+plot(t*1000,p_received );  
+xlabel('Time [ms]', 'FontSize', 14);
+% ラベル: 生データは音圧 [Pa]
+ylabel('Pressure Amplitude [Pa]', 'FontSize', 14); 
+
+%ラベルのx軸かy軸を分ける設定
+if yx_mic_to_plot <=num_mics
+    array_type='(Y)';
+elseif num_mics <yx_mic_to_plot && yx_mic_to_plot<=356
+    array_type='(X)';
+else
+    disp([yx_mic_to_plot '番のマイクが存在しません.マイクは1~356番です']);
+
+end
+% タイトル: TSP応答を示す
+title(['TSP Response at Mic ' num2str(yx_mic_to_plot) array_type ' ' OBJECT_MODE ' ' OBJECT_SHAPE], 'FontSize', 14);
+grid on;
+% グラフが表示されない場合に備えてY軸を自動調整を強制
+ylim('auto');
+
+set(gca, 'FontSize', 14);   % 目盛りのフォントサイズ
+%% HRIRを求める
+
+%TSP信号の長さを受信音の長さと同じにする
+if length(tsp)<length(p_received)
+    tsp=[tsp,zeros(1,length(p_received)-length(tsp))];
+else
+    tsp=tsp(1:length(p_received));
+end
+%一旦fft（高速フーリエ変換）してHRTFを求める　計算が速い
+N_fft=length(p_received); %長さをそろえる
+TSP=fft(tsp,N_fft);
+P_Re=fft(p_received,N_fft);
+
+hrtf=(P_Re./(TSP+eps));% epsでlog(0)回避
+HRIR=real(ifft(hrtf));
+
+%時間軸を作る
+t_hrir = (0:length(HRIR)-1) * kgrid.dt;
+figure(2);
+plot(t_hrir*1000,HRIR);  
+xlabel('Time [ms]', 'FontSize', 14);
+% ラベル: 生データは音圧 [Pa]
+ylabel('Amplitude [Pa]', 'FontSize', 14);
+title(['Estimated HRIR  ' num2str(yx_mic_to_plot) array_type ' ' OBJECT_MODE ' ' OBJECT_SHAPE], 'FontSize', 14);
+grid on;
+
+set(gca, 'FontSize', 14);   % 目盛りのフォントサイズ
+%% HRTFを求める 本当は求めてあるので周波数軸や振幅を設定する
+
+
+%% ===== HRTF算出 =====
+
+fs = 1 / kgrid.dt;
+
+% --- 1. HRIRのピーク（直達波）を探す ---
+[~, idx_peak] = max(abs(HRIR));
+
+% --- 2. 切り出し長を決める（1 ms） ---
+L = round(1.0e-3 * fs);
+
+% 直達波の少し前から切る
+pre = round(0.2e-3 * fs);
+start = max(1, idx_peak - pre);
+
+% --- 3. HRIR切り出し ---
+hrir_cut = HRIR(start : start + L - 1);
+
+% --- 4. 窓関数（Hann） ---
+win = hann(L);
+hrir_win = hrir_cut .* win;
+
+% --- 5. FFT ---
+Nfft = 2^nextpow2(L);
+HRTF = fft(hrir_win, Nfft);
+
+% --- 6. 周波数軸 ---
+f = (0:Nfft/2-1) * fs / Nfft;
+H = HRTF(1:Nfft/2);
+
+% --- 7. 振幅正規化 ---
+H_mag = abs(H);
+H_mag = H_mag / max(H_mag);
+H_dB = 20*log10(H_mag + 1e-12);
+
+% --- 8. プロット ---
+
+figure(3);
+plot(f, H_dB, 'LineWidth', 1.2);
+xlabel('Frequency [Hz]', 'FontSize', 14);
+ylabel('Magnitude [dB]', 'FontSize', 14);
+title(['Estimated HRTF  ' num2str(yx_mic_to_plot) array_type ' ' OBJECT_MODE ' ' OBJECT_SHAPE], 'FontSize', 14);
+grid on;
+f_max_valid = c / (2*dx);
+xlim([200 min(20000, f_max_valid)])
+ylim([-40 10])
+
+
+
+set(gca, 'FontSize', 14);   % 目盛りのフォントサイズ
